@@ -16,6 +16,7 @@ use globset::GlobSet;
 use hashbrown::raw::RawTable;
 use helix_stdx::rope::{self, RopeSliceExt};
 use slotmap::{DefaultKey as LayerId, HopSlotMap};
+use streaming_iterator::StreamingIterator;
 
 use std::{
     borrow::Cow,
@@ -682,7 +683,7 @@ impl TextObjectQuery {
         node: Node<'a>,
         slice: RopeSlice<'a>,
         cursor: &'a mut QueryCursor,
-    ) -> Option<impl Iterator<Item = CapturedNode<'a>>> {
+    ) -> Option<impl StreamingIterator<Item = CapturedNode<'a>>> {
         self.capture_nodes_any(&[capture_name], node, slice, cursor)
     }
 
@@ -694,7 +695,7 @@ impl TextObjectQuery {
         node: Node<'a>,
         slice: RopeSlice<'a>,
         cursor: &'a mut QueryCursor,
-    ) -> Option<impl Iterator<Item = CapturedNode<'a>>> {
+    ) -> Option<impl StreamingIterator<Item = CapturedNode<'a>>> {
         let capture_idx = capture_names
             .iter()
             .find_map(|cap| self.query.capture_index_for_name(cap))?;
@@ -1291,7 +1292,7 @@ impl Syntax {
                 let layer = &self.layers[layer_id];
 
                 // Process injections.
-                let matches = cursor.matches(
+                let mut matches = cursor.matches(
                     &layer.config.injections_query,
                     layer.tree().root_node(),
                     RopeProvider(source_slice),
@@ -1302,10 +1303,10 @@ impl Syntax {
                 ];
                 let mut injections = Vec::new();
                 let mut last_injection_end = 0;
-                for mat in matches {
+                while let Some(mat) = matches.next() {
                     let (injection_capture, content_node, included_children) = layer
                         .config
-                        .injection_for_match(&layer.config.injections_query, &mat, source_slice);
+                        .injection_for_match(&layer.config.injections_query, mat, source_slice);
 
                     // in case this is a combined injection save it for more processing later
                     if let Some(combined_injection_idx) = layer
@@ -1444,16 +1445,15 @@ impl Syntax {
                 cursor_ref.set_byte_range(range.clone().unwrap_or(0..usize::MAX));
                 cursor_ref.set_match_limit(TREE_SITTER_MATCH_LIMIT);
 
-                let mut captures = cursor_ref
-                    .captures(
-                        &layer.config.query,
-                        layer.tree().root_node(),
-                        RopeProvider(source),
-                    )
-                    .peekable();
+                let mut captures = cursor_ref.captures(
+                    &layer.config.query,
+                    layer.tree().root_node(),
+                    RopeProvider(source),
+                );
 
                 // If there's no captures, skip the layer
-                captures.peek()?;
+                captures.advance();
+                captures.get()?;
 
                 Some(HighlightIterLayer {
                     highlight_end_stack: Vec::new(),
@@ -1637,10 +1637,7 @@ impl LanguageLayer {
     }
 }
 
-pub(crate) fn generate_edits(
-    old_text: RopeSlice,
-    changeset: &ChangeSet,
-) -> Vec<tree_sitter::InputEdit> {
+pub fn generate_edits(old_text: RopeSlice, changeset: &ChangeSet) -> Vec<tree_sitter::InputEdit> {
     use Operation::*;
     let mut old_pos = 0;
 
@@ -1717,22 +1714,22 @@ pub(crate) fn generate_edits(
 
                     // replacement
                     edits.push(tree_sitter::InputEdit {
-                        start_byte,                                    // old_pos to byte
-                        old_end_byte,                                  // old_end to byte
-                        new_end_byte: start_byte + s.len(),            // old_pos to byte + s.len()
-                        start_position,                                // old pos to coords
-                        old_end_position,                              // old_end to coords
-                        new_end_position: traverse(start_position, s), // old pos + chars, newlines matter too (iter over)
+                        start_byte,                                     // old_pos to byte
+                        old_end_byte,                                   // old_end to byte
+                        new_end_byte: start_byte + s.len(),             // old_pos to byte + s.len()
+                        start_position,                                 // old pos to coords
+                        old_end_position,                               // old_end to coords
+                        new_end_position: traverse(start_position, &s), // old pos + chars, newlines matter too (iter over)
                     });
                 } else {
                     // insert
                     edits.push(tree_sitter::InputEdit {
-                        start_byte,                                    // old_pos to byte
-                        old_end_byte: start_byte,                      // same
-                        new_end_byte: start_byte + s.len(),            // old_pos + s.len()
-                        start_position,                                // old pos to coords
-                        old_end_position: start_position,              // same
-                        new_end_position: traverse(start_position, s), // old pos + chars, newlines matter too (iter over)
+                        start_byte,                                     // old_pos to byte
+                        old_end_byte: start_byte,                       // same
+                        new_end_byte: start_byte + s.len(),             // old_pos + s.len()
+                        start_position,                                 // old pos to coords
+                        old_end_position: start_position,               // same
+                        new_end_position: traverse(start_position, &s), // old pos + chars, newlines matter too (iter over)
                     });
                 }
             }
@@ -1742,8 +1739,8 @@ pub(crate) fn generate_edits(
     edits
 }
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::{iter, mem, ops, str};
+use std::sync::atomic::AtomicUsize;
+use std::{mem, ops, str};
 use tree_sitter::{
     Language as Grammar, Node, Parser, Point, Query, QueryCaptures, QueryCursor, QueryError,
     QueryMatch, Range, TextProvider, Tree,
@@ -1845,7 +1842,7 @@ impl<'a> TextProvider<&'a [u8]> for RopeProvider<'a> {
 struct HighlightIterLayer<'a> {
     _tree: Option<Tree>,
     cursor: QueryCursor,
-    captures: RefCell<iter::Peekable<QueryCaptures<'a, 'a, RopeProvider<'a>, &'a [u8]>>>,
+    captures: RefCell<QueryCaptures<'a, 'a, RopeProvider<'a>, &'a [u8]>>,
     config: &'a HighlightConfiguration,
     highlight_end_stack: Vec<usize>,
     scope_stack: Vec<LocalScope<'a>>,
@@ -2117,8 +2114,8 @@ impl HighlightIterLayer<'_> {
         let depth = -(self.depth as isize);
         let next_start = self
             .captures
-            .borrow_mut()
-            .peek()
+            .borrow()
+            .get()
             .map(|(m, i)| m.captures[*i].node.start_byte());
         let next_end = self.highlight_end_stack.last().cloned();
         match (next_start, next_end) {
@@ -2306,216 +2303,7 @@ impl Iterator for HighlightIter<'_> {
     type Item = Result<HighlightEvent, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        'main: loop {
-            // If we've already determined the next highlight boundary, just return it.
-            if let Some(e) = self.next_event.take() {
-                return Some(Ok(e));
-            }
-
-            // Periodically check for cancellation, returning `Cancelled` error if the
-            // cancellation flag was flipped.
-            if let Some(cancellation_flag) = self.cancellation_flag {
-                self.iter_count += 1;
-                if self.iter_count >= CANCELLATION_CHECK_INTERVAL {
-                    self.iter_count = 0;
-                    if cancellation_flag.load(Ordering::Relaxed) != 0 {
-                        return Some(Err(Error::Cancelled));
-                    }
-                }
-            }
-
-            // If none of the layers have any more highlight boundaries, terminate.
-            if self.layers.is_empty() {
-                let len = self.source.len_bytes();
-                return if self.byte_offset < len {
-                    let result = Some(Ok(HighlightEvent::Source {
-                        start: self.byte_offset,
-                        end: len,
-                    }));
-                    self.byte_offset = len;
-                    result
-                } else {
-                    None
-                };
-            }
-
-            // Get the next capture from whichever layer has the earliest highlight boundary.
-            let range;
-            let layer = &mut self.layers[0];
-            let captures = layer.captures.get_mut();
-            if let Some((next_match, capture_index)) = captures.peek() {
-                let next_capture = next_match.captures[*capture_index];
-                range = next_capture.node.byte_range();
-
-                // If any previous highlight ends before this node starts, then before
-                // processing this capture, emit the source code up until the end of the
-                // previous highlight, and an end event for that highlight.
-                if let Some(end_byte) = layer.highlight_end_stack.last().cloned() {
-                    if end_byte <= range.start {
-                        layer.highlight_end_stack.pop();
-                        return self.emit_event(end_byte, Some(HighlightEvent::HighlightEnd));
-                    }
-                }
-            }
-            // If there are no more captures, then emit any remaining highlight end events.
-            // And if there are none of those, then just advance to the end of the document.
-            else if let Some(end_byte) = layer.highlight_end_stack.last().cloned() {
-                layer.highlight_end_stack.pop();
-                return self.emit_event(end_byte, Some(HighlightEvent::HighlightEnd));
-            } else {
-                return self.emit_event(self.source.len_bytes(), None);
-            };
-
-            let (mut match_, capture_index) = captures.next().unwrap();
-            let mut capture = match_.captures[capture_index];
-
-            // Remove from the local scope stack any local scopes that have already ended.
-            while range.start > layer.scope_stack.last().unwrap().range.end {
-                layer.scope_stack.pop();
-            }
-
-            // If this capture is for tracking local variables, then process the
-            // local variable info.
-            let mut reference_highlight = None;
-            let mut definition_highlight = None;
-            while match_.pattern_index < layer.config.highlights_pattern_index {
-                // If the node represents a local scope, push a new local scope onto
-                // the scope stack.
-                if Some(capture.index) == layer.config.local_scope_capture_index {
-                    definition_highlight = None;
-                    let mut scope = LocalScope {
-                        inherits: true,
-                        range: range.clone(),
-                        local_defs: Vec::new(),
-                    };
-                    for prop in layer.config.query.property_settings(match_.pattern_index) {
-                        if let "local.scope-inherits" = prop.key.as_ref() {
-                            scope.inherits =
-                                prop.value.as_ref().map_or(true, |r| r.as_ref() == "true");
-                        }
-                    }
-                    layer.scope_stack.push(scope);
-                }
-                // If the node represents a definition, add a new definition to the
-                // local scope at the top of the scope stack.
-                else if Some(capture.index) == layer.config.local_def_capture_index {
-                    reference_highlight = None;
-                    let scope = layer.scope_stack.last_mut().unwrap();
-
-                    let mut value_range = 0..0;
-                    for capture in match_.captures {
-                        if Some(capture.index) == layer.config.local_def_value_capture_index {
-                            value_range = capture.node.byte_range();
-                        }
-                    }
-
-                    let name = byte_range_to_str(range.clone(), self.source);
-                    scope.local_defs.push(LocalDef {
-                        name,
-                        value_range,
-                        highlight: None,
-                    });
-                    definition_highlight = scope.local_defs.last_mut().map(|s| &mut s.highlight);
-                }
-                // If the node represents a reference, then try to find the corresponding
-                // definition in the scope stack.
-                else if Some(capture.index) == layer.config.local_ref_capture_index
-                    && definition_highlight.is_none()
-                {
-                    definition_highlight = None;
-                    let name = byte_range_to_str(range.clone(), self.source);
-                    for scope in layer.scope_stack.iter().rev() {
-                        if let Some(highlight) = scope.local_defs.iter().rev().find_map(|def| {
-                            if def.name == name && range.start >= def.value_range.end {
-                                Some(def.highlight)
-                            } else {
-                                None
-                            }
-                        }) {
-                            reference_highlight = highlight;
-                            break;
-                        }
-                        if !scope.inherits {
-                            break;
-                        }
-                    }
-                }
-
-                // Continue processing any additional matches for the same node.
-                if let Some((next_match, next_capture_index)) = captures.peek() {
-                    let next_capture = next_match.captures[*next_capture_index];
-                    if next_capture.node == capture.node {
-                        capture = next_capture;
-                        match_ = captures.next().unwrap().0;
-                        continue;
-                    }
-                }
-
-                self.sort_layers();
-                continue 'main;
-            }
-
-            // Otherwise, this capture must represent a highlight.
-            // If this exact range has already been highlighted by an earlier pattern, or by
-            // a different layer, then skip over this one.
-            if let Some((last_start, last_end, last_depth)) = self.last_highlight_range {
-                if range.start == last_start && range.end == last_end && layer.depth < last_depth {
-                    self.sort_layers();
-                    continue 'main;
-                }
-            }
-
-            // If the current node was found to be a local variable, then skip over any
-            // highlighting patterns that are disabled for local variables.
-            if definition_highlight.is_some() || reference_highlight.is_some() {
-                while layer.config.non_local_variable_patterns[match_.pattern_index] {
-                    match_.remove();
-                    if let Some((next_match, next_capture_index)) = captures.peek() {
-                        let next_capture = next_match.captures[*next_capture_index];
-                        if next_capture.node == capture.node {
-                            capture = next_capture;
-                            match_ = captures.next().unwrap().0;
-                            continue;
-                        }
-                    }
-
-                    self.sort_layers();
-                    continue 'main;
-                }
-            }
-
-            // Once a highlighting pattern is found for the current node, skip over
-            // any later highlighting patterns that also match this node. Captures
-            // for a given node are ordered by pattern index, so these subsequent
-            // captures are guaranteed to be for highlighting, not injections or
-            // local variables.
-            while let Some((next_match, next_capture_index)) = captures.peek() {
-                let next_capture = next_match.captures[*next_capture_index];
-                if next_capture.node == capture.node {
-                    captures.next();
-                } else {
-                    break;
-                }
-            }
-
-            let current_highlight = layer.config.highlight_indices.load()[capture.index as usize];
-
-            // If this node represents a local definition, then store the current
-            // highlight value on the local scope entry representing this node.
-            if let Some(definition_highlight) = definition_highlight {
-                *definition_highlight = current_highlight;
-            }
-
-            // Emit a scope start event and push the node's end position to the stack.
-            if let Some(highlight) = reference_highlight.or(current_highlight) {
-                self.last_highlight_range = Some((range.start, range.end, layer.depth));
-                layer.highlight_end_stack.push(range.end);
-                return self
-                    .emit_event(range.start, Some(HighlightEvent::HighlightStart(highlight)));
-            }
-
-            self.sort_layers();
-        }
+        None
     }
 }
 
@@ -2774,18 +2562,13 @@ mod test {
 
         let root = syntax.tree().root_node();
         let mut test = |capture, range| {
-            let matches: Vec<_> = textobject
+            let captures = textobject
                 .capture_nodes(capture, root, source.slice(..), &mut cursor)
-                .unwrap()
-                .collect();
+                .unwrap();
 
-            assert_eq!(
-                matches[0].byte_range(),
-                range,
-                "@{} expected {:?}",
-                capture,
-                range
-            )
+            let matches: Vec<_> = captures.map_deref(|c| c.byte_range()).collect();
+
+            assert_eq!(matches[0], range, "@{} expected {:?}", capture, range)
         };
 
         test("quantified_nodes", 1..37);

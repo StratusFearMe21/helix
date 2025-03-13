@@ -615,7 +615,10 @@ impl Transaction {
         let mut last = 0;
         for (from, to, tendril) in changes {
             // Verify ranges are ordered and not overlapping
-            debug_assert!(last <= from);
+            debug_assert!(
+                last <= from,
+                "Edits must be ordered and non-overlapping ({last} <= {from})"
+            );
             // Verify ranges are correct
             debug_assert!(
                 from <= to,

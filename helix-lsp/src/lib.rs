@@ -987,6 +987,7 @@ pub fn find_lsp_workspace(
 mod tests {
     use super::{lsp, util::*, OffsetEncoding};
     use helix_core::Rope;
+    use tokio::io::stdout;
 
     #[test]
     fn converts_lsp_pos_to_pos() {
@@ -1050,5 +1051,10 @@ mod tests {
 
         let transaction = generate_transaction_from_edits(&source, edits, OffsetEncoding::Utf8);
         assert!(transaction.apply(&mut source));
+        use std::io::Write;
+        std::io::stdout()
+            .lock()
+            .write_all(source.to_string().as_bytes())
+            .unwrap();
     }
 }
